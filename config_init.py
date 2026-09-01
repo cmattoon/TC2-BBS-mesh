@@ -160,7 +160,7 @@ def get_interface(system_config:dict[str, Any]) -> meshtastic.stream_interface.S
             noNodes = (system_config.get('no_nodes', 'false').lower() == 'true')
             if system_config['interface_type'] == 'serial':
                 if system_config['port']:
-                    return meshtastic.serial_interface.SerialInterface(system_config['port'] noNodes=noNodes)
+                    return meshtastic.serial_interface.SerialInterface(system_config['port'], noNodes=noNodes)
                 else:
                     ports = list(serial.tools.list_ports.comports())
                     if len(ports) == 1:
