@@ -68,7 +68,10 @@ def main():
     initialize_database()
 
     def receive_packet(packet, interface):
-        on_receive(packet, interface)
+        try:
+            on_receive(packet, interface)
+        except Exception as e:
+            print(f"caught exception during receive_packet: {e}")
 
     pub.subscribe(receive_packet, system_config['mqtt_topic'])
 
