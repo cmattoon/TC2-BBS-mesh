@@ -118,10 +118,13 @@ def initialize_config(config_file: str = None) -> dict[str, Any]:
     if allowed_nodes == ['']:
         allowed_nodes = []
 
+    # Pi Zero doesn't like the node DB setup.
+    disable_node_db = config.getboolean('hack', 'disable_node_db', fallback=False)
+
     print(f"Nodes with Urgent board permissions: {allowed_nodes}")
 
     return {
-        'no_nodes': config.get('hack', {}).get('no_nodes', 'false'), 
+        'disable_node_db': disable_node_db,
         'config': config,
         'interface_type': interface_type,
         'hostname': hostname,
@@ -157,10 +160,10 @@ def get_interface(system_config:dict[str, Any]) -> meshtastic.stream_interface.S
     """
     while True:
         try:
-            noNodes = (system_config.get('no_nodes', 'false').lower() == 'true')
+            noNodes = True
             if system_config['interface_type'] == 'serial':
                 if system_config['port']:
-                    return meshtastic.serial_interface.SerialInterface(system_config['port'], noNodes=noNodes)
+                    return meshtastic.serial_interface.SerialInterface(system_config['port'], noNodes=system_config['disable_node_db'])
                 else:
                     ports = list(serial.tools.list_ports.comports())
                     if len(ports) == 1:

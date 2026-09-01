@@ -220,6 +220,7 @@ def handle_bb_steps(sender_id, message, step, state, interface, bbs_nodes):
                 send_message("Error: Unable to retrieve your node information.", sender_id, interface)
                 update_user_state(sender_id, None)
                 return
+            # Fall back to the sender info when node_info is missing (because 'disable_node_db' is True)
             sender_short_name = (node_info.get('user', {}).get('shortName') if node_info else None) or f"!{sender_id:08x}"
             unique_id = add_bulletin(board, sender_short_name, subject, content, bbs_nodes, interface)
             send_message(f"Your bulletin '{subject}' has been posted to {board}.\n(╯°□°)╯📄📌[{board}]", sender_id, interface)
