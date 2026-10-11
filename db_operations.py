@@ -33,6 +33,13 @@ def initialize_database():
                     content TEXT NOT NULL,
                     unique_id TEXT NOT NULL
                 )''')
+    # Migration: track the actual sender node ID, not just the display name -
+    # short names aren't guaranteed unique, so this is needed to reliably
+    # trace authorship. Guarded for DBs created before this column existed.
+    try:
+        c.execute('ALTER TABLE bulletins ADD COLUMN sender_id TEXT')
+    except sqlite3.OperationalError:
+        pass  # column already exists
     c.execute('''CREATE TABLE IF NOT EXISTS mail (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     sender TEXT NOT NULL,
@@ -69,18 +76,25 @@ def get_channels():
 
 
 
-def add_bulletin(board, sender_short_name, subject, content, bbs_nodes, interface, unique_id=None):
+def add_bulletin(board, sender_short_name, subject, content, bbs_nodes, interface, unique_id=None, sender_id=None):
+    """
+    `sender_id` should be the poster's canonical '!xxxxxxxx' node ID, when
+    known - `sender_short_name` is kept purely for display, since short
+    names aren't guaranteed unique and can't reliably identify who posted.
+    """
     conn = get_db_connection()
     c = conn.cursor()
     date = datetime.now().strftime('%Y-%m-%d %H:%M')
     if not unique_id:
         unique_id = str(uuid.uuid4())
     c.execute(
-        "INSERT INTO bulletins (board, sender_short_name, date, subject, content, unique_id) VALUES (?, ?, ?, ?, ?, ?)",
-        (board, sender_short_name, date, subject, content, unique_id))
+        "INSERT INTO bulletins (board, sender_short_name, date, subject, content, unique_id, sender_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (board, sender_short_name, date, subject, content, unique_id, sender_id))
     conn.commit()
     if bbs_nodes and interface:
-        send_bulletin_to_bbs_nodes(board, sender_short_name, subject, content, unique_id, bbs_nodes, interface)
+        send_bulletin_to_bbs_nodes(board, sender_short_name, subject, content, unique_id, bbs_nodes, interface,
+                                   sender_id=sender_id)
 
     # New logic to send group chat notification for urgent bulletins
     if board.lower() == "urgent":
@@ -99,7 +113,7 @@ def get_bulletins(board):
 def get_bulletin_content(bulletin_id):
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT sender_short_name, date, subject, content, unique_id FROM bulletins WHERE id = ?", (bulletin_id,))
+    c.execute("SELECT sender_short_name, date, subject, content, unique_id, sender_id FROM bulletins WHERE id = ?", (bulletin_id,))
     return c.fetchone()
 
 
@@ -137,6 +151,12 @@ def get_mail_content(mail_id, recipient_id):
     return c.fetchone()
 
 def delete_mail(unique_id, recipient_id, bbs_nodes, interface):
+    """
+    Deletes the mail identified by `unique_id`, but only if `recipient_id`
+    (when provided) actually matches the mail's recorded recipient - this
+    guards against deleting someone else's mail if a caller ever passes a
+    mismatched/stale recipient_id.
+    """
     conn = get_db_connection()
     c = conn.cursor()
     try:
@@ -145,9 +165,15 @@ def delete_mail(unique_id, recipient_id, bbs_nodes, interface):
         if result is None:
             logging.error(f"No mail found with unique_id: {unique_id}")
             return  # Early exit if no matching mail found
-        recipient_id = result[0]
-        logging.info(f"Attempting to delete mail with unique_id: {unique_id} by {recipient_id}")
-        c.execute("DELETE FROM mail WHERE unique_id = ? and recipient = ?", (unique_id, recipient_id,))
+        actual_recipient_id = result[0]
+        if recipient_id is not None and actual_recipient_id != recipient_id:
+            logging.error(
+                f"Refusing to delete mail {unique_id}: requested by {recipient_id!r} "
+                f"but it belongs to {actual_recipient_id!r}"
+            )
+            return
+        logging.info(f"Attempting to delete mail with unique_id: {unique_id} by {actual_recipient_id}")
+        c.execute("DELETE FROM mail WHERE unique_id = ? and recipient = ?", (unique_id, actual_recipient_id))
         conn.commit()
         send_delete_mail_to_bbs_nodes(unique_id, bbs_nodes, interface)
         logging.info(f"Mail with unique_id: {unique_id} deleted and sync message sent.")

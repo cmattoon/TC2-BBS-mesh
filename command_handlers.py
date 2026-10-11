@@ -1,6 +1,7 @@
 import configparser
 import logging
 import random
+import re
 import time
 
 from meshtastic import BROADCAST_NUM
@@ -13,9 +14,15 @@ from db_operations import (
 )
 from utils import (
     get_node_id_from_num, get_node_info,
-    get_node_short_name, send_message,
+    get_node_short_name, resolve_node_identifier, send_message,
     update_user_state
 )
+
+# Matches the quick "!<node id>: <message>" direct-message command, e.g.
+# "!09d3db18: hey, got a sec?" - captures the target up to the first colon
+# (not whitespace, since node IDs/short names never contain spaces) and the
+# rest of the line as the first chunk of message content.
+DIRECT_MESSAGE_COMMAND_RE = re.compile(r'^!(?P<target>[^:\s]+):\s*(?P<rest>.*)$', re.DOTALL)
 
 # Read the configuration for menu options
 config = configparser.ConfigParser()
@@ -68,10 +75,16 @@ def handle_help_command(sender_id, interface, menu_name=None):
     send_message(response, sender_id, interface)
 
 def get_node_name(node_id, interface):
+    """
+    Returns the best display name we have for `node_id` (a canonical
+    '!xxxxxxxx' node ID): longName, falling back to shortName, falling back
+    to the ID itself if the node is unknown/partially known.
+    """
+    if not node_id:
+        return "Unknown node"
     node_info = interface.nodes.get(node_id)
-    if node_info:
-        return node_info['user']['longName']
-    return f"Node {node_id}"
+    user = (node_info or {}).get('user') or {}
+    return user.get('longName') or user.get('shortName') or node_id
 
 
 def handle_mail_command(sender_id, interface):
@@ -137,7 +150,10 @@ def handle_stats_steps(sender_id, message, step, interface):
                     total_nodes = len(interface.nodes)
                 else:
                     time_limit = current_time - seconds
-                    total_nodes = sum(1 for node in interface.nodes.values() if node.get('lastHeard') is not None and node['lastHeard'] >= time_limit)
+                    total_nodes = sum(
+                        1 for node in interface.nodes.values()
+                        if (node.get('lastHeard') or 0) >= time_limit
+                    )
                 total_nodes_summary.append(f"- {period}: {total_nodes}")
 
             response = "Total nodes seen:\n" + "\n".join(total_nodes_summary)
@@ -146,7 +162,7 @@ def handle_stats_steps(sender_id, message, step, interface):
         elif choice == 'h':
             hw_models = {}
             for node in interface.nodes.values():
-                hw_model = node['user'].get('hwModel', 'Unknown')
+                hw_model = (node.get('user') or {}).get('hwModel', 'Unknown')
                 hw_models[hw_model] = hw_models.get(hw_model, 0) + 1
             response = "Hardware Models:\n" + "\n".join([f"{model}: {count}" for model, count in hw_models.items()])
             send_message(response, sender_id, interface)
@@ -154,7 +170,7 @@ def handle_stats_steps(sender_id, message, step, interface):
         elif choice == 'r':
             roles = {}
             for node in interface.nodes.values():
-                role = node['user'].get('role', 'Unknown')
+                role = (node.get('user') or {}).get('role', 'Unknown')
                 roles[role] = roles.get(role, 0) + 1
             response = "Roles:\n" + "\n".join([f"{role}: {count}" for role, count in roles.items()])
             send_message(response, sender_id, interface)
@@ -199,7 +215,7 @@ def handle_bb_steps(sender_id, message, step, state, interface, bbs_nodes):
 
     elif step == 3:
         bulletin_id = int(message)
-        sender_short_name, date, subject, content, unique_id = get_bulletin_content(bulletin_id)
+        sender_short_name, date, subject, content, unique_id, sender_node_id = get_bulletin_content(bulletin_id)
         send_message(f"From: {sender_short_name}\nDate: {date}\nSubject: {subject}\n- - - - - - -\n{content}", sender_id, interface)
         board_name = state['board']
         handle_bb_steps(sender_id, 'e', 1, state, interface, bbs_nodes)
@@ -214,17 +230,12 @@ def handle_bb_steps(sender_id, message, step, state, interface, bbs_nodes):
             board = state['board']
             subject = state['subject']
             content = state['content']
+            # node_id may be None if the node isn't fully known yet (e.g. the
+            # 'disable_node_db' hack is active) - fall back to a pseudo-ID
+            # built from the numeric sender_id in that case.
             node_id = get_node_id_from_num(sender_id, interface)
-            node_info = interface.nodes.get(node_id)
-
-            if node_info is None:
-                logging.debug(f"node_info is empty; falling back to sender_id ({sender_id} -> {sender_id:08x})")
-                #send_message("Error: Unable to retrieve your node information.", sender_id, interface)
-                #update_user_state(sender_id, None)
-                #return
-            # Fall back to the sender info when node_info is missing (because 'disable_node_db' is True)
-            sender_short_name = (node_info.get('user', {}).get('shortName') if node_info else None) or f"!{sender_id:08x}"
-            unique_id = add_bulletin(board, sender_short_name, subject, content, bbs_nodes, interface)
+            sender_short_name = get_node_short_name(node_id, interface) if node_id else f"!{sender_id:08x}"
+            unique_id = add_bulletin(board, sender_short_name, subject, content, bbs_nodes, interface, sender_id=node_id)
             send_message(f"Your bulletin '{subject}' has been posted to {board}.\n(╯°□°)╯📄📌[{board}]", sender_id, interface)
             handle_bb_steps(sender_id, 'e', 1, state, interface, bbs_nodes)
         else:
@@ -252,7 +263,10 @@ def handle_mail_steps(sender_id, message, step, state, interface, bbs_nodes):
                 send_message("There are no messages in your mailbox.📭", sender_id, interface)
                 update_user_state(sender_id, None)
         elif choice == 's':
-            send_message("What is the Short Name of the node you want to leave a message for?", sender_id, interface)
+            send_message(
+                "What is the Short Name (or Node ID, e.g. !09d3db18) of the node you want to leave a message for?",
+                sender_id, interface
+            )
             update_user_state(sender_id, {'command': 'MAIL', 'step': 3})
         elif choice == 'x':
             handle_help_command(sender_id, interface)
@@ -271,21 +285,23 @@ def handle_mail_steps(sender_id, message, step, state, interface, bbs_nodes):
             update_user_state(sender_id, None)
 
     elif step == 3:
-        short_name = message.lower()
-        nodes = get_node_info(interface, short_name)
-        if not nodes:
-            send_message("I'm unable to find that node in my database.", sender_id, interface)
-            handle_mail_command(sender_id, interface)
-        elif len(nodes) == 1:
-            recipient_id = nodes[0]['num']
+        resolved = resolve_node_identifier(message.strip(), interface)
+        if resolved.matches:
+            send_message(
+                "There are multiple nodes with that short name. Which one would you like to leave a message for?",
+                sender_id, interface
+            )
+            for i, (match_node_id, match_node_info) in enumerate(resolved.matches):
+                send_message(f"[{i}] {get_node_name(match_node_id, interface)} ({match_node_id})", sender_id, interface)
+            update_user_state(sender_id, {'command': 'MAIL', 'step': 6, 'matches': resolved.matches})
+        elif resolved.node_id:
+            recipient_id = resolved.node_id
             recipient_name = get_node_name(recipient_id, interface)
             send_message(f"What is the subject of your message to {recipient_name}?\nKeep it short.", sender_id, interface)
             update_user_state(sender_id, {'command': 'MAIL', 'step': 5, 'recipient_id': recipient_id})
         else:
-            send_message("There are multiple nodes with that short name. Which one would you like to leave a message for?", sender_id, interface)
-            for i, node in enumerate(nodes):
-                send_message(f"[{i}] {node['longName']}", sender_id, interface)
-            update_user_state(sender_id, {'command': 'MAIL', 'step': 6, 'nodes': nodes})
+            send_message("I'm unable to find that node in my database.", sender_id, interface)
+            handle_mail_command(sender_id, interface)
 
     elif step == 4:
         if message.lower() == "d":
@@ -308,9 +324,12 @@ def handle_mail_steps(sender_id, message, step, state, interface, bbs_nodes):
         update_user_state(sender_id, {'command': 'MAIL', 'step': 7, 'recipient_id': state['recipient_id'], 'subject': subject, 'content': ''})
 
     elif step == 6:
-        selected_node_index = int(message)
-        selected_node = state['nodes'][selected_node_index]
-        recipient_id = selected_node['num']
+        try:
+            selected_node_index = int(message)
+            recipient_id, _ = state['matches'][selected_node_index]
+        except (ValueError, IndexError, KeyError):
+            send_message("Invalid selection. Please try again.", sender_id, interface)
+            return
         recipient_name = get_node_name(recipient_id, interface)
         send_message(f"What is the subject of your message to {recipient_name}?\nKeep it short.", sender_id, interface)
         update_user_state(sender_id, {'command': 'MAIL', 'step': 5, 'recipient_id': recipient_id})
@@ -346,13 +365,92 @@ def handle_mail_steps(sender_id, message, step, state, interface, bbs_nodes):
             update_user_state(sender_id, None)
 
 
+def handle_direct_message_command(sender_id, message, interface, bbs_nodes):
+    """
+    Handles the quick `!<node id>: <message>` command, letting a user DM the
+    BBS to leave mail for another node addressed directly by its Node ID -
+    preferred over short names, since those aren't guaranteed unique.
+    Reuses the same compose-then-terminator mail flow as the regular Mail
+    command (see handle_direct_message_steps).
+
+    Returns True if `message` matched the command and was handled (even if
+    resolution failed and an error was sent back), False if it didn't match
+    the pattern at all, so the caller can fall through to normal dispatch.
+    """
+    match = DIRECT_MESSAGE_COMMAND_RE.match(message)
+    if not match:
+        return False
+
+    target = match.group('target')
+    first_line = match.group('rest') or ""
+
+    # The command's own leading '!' plus the target together form the
+    # canonical node ID - reconstruct it before resolving, since this
+    # command is ID-only by design (that's the whole point: it sidesteps
+    # the short-name-ambiguity problem that the Mail menu's "Short Name"
+    # prompt still has to deal with).
+    resolved = resolve_node_identifier(f"!{target}", interface)
+    if resolved.error:
+        send_message(
+            f"Couldn't resolve '!{target}' to a node: {resolved.error}\n"
+            f"Expected format: !<node id>: <message>, e.g. !09d3db18: hello",
+            sender_id, interface
+        )
+        return True
+
+    recipient_id = resolved.node_id
+    recipient_label = resolved.short_name or "NONE"
+    content = first_line.strip()
+
+    send_message(
+        f"Continue typing or enter SEND to send to {recipient_id} ({recipient_label})",
+        sender_id, interface
+    )
+    update_user_state(sender_id, {
+        'command': 'DIRECT_MESSAGE',
+        'step': 1,
+        'recipient_id': recipient_id,
+        'recipient_label': recipient_label,
+        'content': (content + "\n") if content else "",
+    })
+    return True
+
+
+def handle_direct_message_steps(sender_id, message, state, interface, bbs_nodes):
+    if message.strip().lower() == 'send':
+        recipient_id = state['recipient_id']
+        content = state.get('content', '').strip()
+        if not content:
+            send_message("Message is empty - nothing sent. Feel free to try again.", sender_id, interface)
+            update_user_state(sender_id, None)
+            return
+
+        sender_node_id = get_node_id_from_num(sender_id, interface)
+        sender_short_name = get_node_short_name(sender_node_id, interface)
+        recipient_name = get_node_name(recipient_id, interface)
+
+        add_mail(sender_node_id, sender_short_name, recipient_id, "Direct Message", content, bbs_nodes, interface)
+        send_message(f"Message has been posted to the mailbox of {recipient_name}.\n(╯°□°)╯📨📬", sender_id, interface)
+
+        notification_message = (
+            f"You have a new mail message from {sender_short_name}. "
+            f"Check your mailbox by responding to this message with CM."
+        )
+        send_message(notification_message, recipient_id, interface)
+
+        update_user_state(sender_id, None)
+    else:
+        state['content'] = state.get('content', '') + message + "\n"
+        update_user_state(sender_id, state)
+
+
 def handle_wall_of_shame_command(sender_id, interface):
     response = "Devices with battery levels below 20%:\n"
     for node_id, node in interface.nodes.items():
-        metrics = node.get('deviceMetrics', {})
+        metrics = node.get('deviceMetrics') or {}
         battery_level = metrics.get('batteryLevel', 101)
         if battery_level < 20:
-            long_name = node['user']['longName']
+            long_name = (node.get('user') or {}).get('longName') or node_id
             response += f"{long_name} - Battery {battery_level}%\n"
     if response == "Devices with battery levels below 20%:\n":
         response = "No devices with battery levels below 20% found."
@@ -414,24 +512,30 @@ def handle_send_mail_command(sender_id, message, interface, bbs_nodes):
     try:
         parts = message.split(",,", 3)
         if len(parts) != 4:
-            send_message("Send Mail Quick Command format:\nSM,,{short_name},,{subject},,{message}", sender_id, interface)
+            send_message(
+                "Send Mail Quick Command format:\nSM,,{short_name_or_node_id},,{subject},,{message}",
+                sender_id, interface
+            )
             return
 
-        _, short_name, subject, content = parts
-        nodes = get_node_info(interface, short_name.lower())
-        if not nodes:
-            send_message(f"Node with short name '{short_name}' not found.", sender_id, interface)
+        _, identifier, subject, content = parts
+        resolved = resolve_node_identifier(identifier.strip(), interface)
+        if resolved.matches:
+            send_message(
+                f"Multiple nodes with short name '{identifier}' found. Please be more specific, or use the node ID.",
+                sender_id, interface
+            )
             return
-        if len(nodes) > 1:
-            send_message(f"Multiple nodes with short name '{short_name}' found. Please be more specific.", sender_id,
-                         interface)
+        if not resolved.node_id:
+            send_message(f"Node '{identifier}' not found.", sender_id, interface)
             return
 
-        recipient_id = nodes[0]['num']
+        recipient_id = resolved.node_id
         recipient_name = get_node_name(recipient_id, interface)
-        sender_short_name = get_node_short_name(get_node_id_from_num(sender_id, interface), interface)
+        sender_node_id = get_node_id_from_num(sender_id, interface)
+        sender_short_name = get_node_short_name(sender_node_id, interface)
 
-        unique_id = add_mail(get_node_id_from_num(sender_id, interface), sender_short_name, recipient_id, subject,
+        unique_id = add_mail(sender_node_id, sender_short_name, recipient_id, subject,
                              content, bbs_nodes, interface)
         send_message(f"Mail has been sent to {recipient_name}.", sender_id, interface)
 
@@ -522,9 +626,11 @@ def handle_post_bulletin_command(sender_id, message, interface, bbs_nodes):
             return
 
         _, board_name, subject, content = parts
-        sender_short_name = get_node_short_name(get_node_id_from_num(sender_id, interface), interface)
+        sender_node_id = get_node_id_from_num(sender_id, interface)
+        sender_short_name = get_node_short_name(sender_node_id, interface) if sender_node_id else f"!{sender_id:08x}"
 
-        unique_id = add_bulletin(board_name, sender_short_name, subject, content, bbs_nodes, interface)
+        unique_id = add_bulletin(board_name, sender_short_name, subject, content, bbs_nodes, interface,
+                                 sender_id=sender_node_id)
         send_message(f"Your bulletin '{subject}' has been posted to {board_name}.", sender_id, interface)
 
 
@@ -572,7 +678,7 @@ def handle_read_bulletin_command(sender_id, message, state, interface):
             return
 
         bulletin_id = bulletins[message_number][0]
-        sender, date, subject, content, unique_id = get_bulletin_content(bulletin_id)
+        sender, date, subject, content, unique_id, sender_node_id = get_bulletin_content(bulletin_id)
         response = f"Date: {date}\nFrom: {sender}\nSubject: {subject}\n\n{content}"
         send_message(response, sender_id, interface)
 
@@ -666,5 +772,6 @@ def handle_list_channels_command(sender_id, interface):
 
 def handle_quick_help_command(sender_id, interface):
     response = ("✈️QUICK COMMANDS✈️\nSend command below for usage info:\nSM,, - Send "
-                "Mail\nCM - Check Mail\nPB,, - Post Bulletin\nCB,, - Check Bulletins\n")
+                "Mail\nCM - Check Mail\nPB,, - Post Bulletin\nCB,, - Check Bulletins\n"
+                "!<node id>: - Message a node directly by ID, e.g. !09d3db18: hello\n")
     send_message(response, sender_id, interface)

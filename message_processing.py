@@ -8,7 +8,8 @@ from command_handlers import (
     handle_channel_directory_command, handle_channel_directory_steps, handle_send_mail_command,
     handle_read_mail_command, handle_check_mail_command, handle_delete_mail_confirmation, handle_post_bulletin_command,
     handle_check_bulletin_command, handle_read_bulletin_command, handle_read_channel_command,
-    handle_post_channel_command, handle_list_channels_command, handle_quick_help_command
+    handle_post_channel_command, handle_list_channels_command, handle_quick_help_command,
+    handle_direct_message_command, handle_direct_message_steps
 )
 from db_operations import add_bulletin, add_mail, delete_bulletin, delete_mail, get_db_connection, add_channel
 from js8call_integration import handle_js8call_command, handle_js8call_steps, handle_group_message_selection
@@ -71,7 +72,12 @@ def process_message(sender_id, message, interface, is_sync_message=False):
         if message.startswith("BULLETIN|"):
             parts = message.split("|")
             board, sender_short_name, subject, content, unique_id = parts[1], parts[2], parts[3], parts[4], parts[5]
-            add_bulletin(board, sender_short_name, subject, content, [], interface, unique_id=unique_id)
+            # sender_id is an optional trailing field (added after the fact,
+            # appended rather than inserted) - absent from peers running
+            # older BBS code, so fall back to None rather than erroring.
+            sender_id_field = parts[6] if len(parts) > 6 else None
+            add_bulletin(board, sender_short_name, subject, content, [], interface, unique_id=unique_id,
+                        sender_id=sender_id_field)
 
             if board.lower() == "urgent":
                 notification_message = f"💥NEW URGENT BULLETIN💥\nFrom: {sender_short_name}\nTitle: {subject}\nDM 'CB,,Urgent' to view"
@@ -93,7 +99,13 @@ def process_message(sender_id, message, interface, is_sync_message=False):
             channel_name, channel_url = parts[1], parts[2]
             add_channel(channel_name, channel_url)
     else:
-        if message_lower.startswith("sm,,"):
+        if state and state.get('command') == 'DIRECT_MESSAGE':
+            # Composing a direct message (via "!<id>: ..."): everything up to
+            # "SEND" is appended as content, regardless of what it starts
+            # with, so this must take priority over the quick-command checks
+            # below.
+            handle_direct_message_steps(sender_id, message_strip, state, interface, bbs_nodes)
+        elif message_lower.startswith("sm,,"):
             handle_send_mail_command(sender_id, message_strip, interface, bbs_nodes)
         elif message_lower.startswith("cm"):
             handle_check_mail_command(sender_id, interface)
@@ -105,6 +117,8 @@ def process_message(sender_id, message, interface, is_sync_message=False):
             handle_post_channel_command(sender_id, message_strip, interface)
         elif message_lower.startswith("chl"):
             handle_list_channels_command(sender_id, interface)
+        elif message_strip.startswith("!") and handle_direct_message_command(sender_id, message_strip, interface, bbs_nodes):
+            pass
         else:
             if state and state['command'] == 'MENU':
                 menu_name = state['menu']
@@ -181,43 +195,57 @@ def process_message(sender_id, message, interface, is_sync_message=False):
 
 def on_receive(packet, interface):
     try:
-        if 'decoded' in packet and packet['decoded']['portnum'] == 'TEXT_MESSAGE_APP':
-            message_bytes = packet['decoded']['payload']
+        decoded = packet.get('decoded') or {}
+        if decoded.get('portnum') != 'TEXT_MESSAGE_APP':
+            return
+
+        message_bytes = decoded.get('payload')
+        sender_id = packet.get('from')
+        to_id = packet.get('to')
+        sender_node_id = packet.get('fromId')
+
+        if message_bytes is None or sender_id is None or sender_node_id is None:
+            logging.warning(f"Ignoring malformed TEXT_MESSAGE_APP packet (missing from/fromId/payload): {packet}")
+            return
+
+        try:
             message_string = message_bytes.decode('utf-8')
-            sender_id = packet['from']
-            to_id = packet.get('to')
-            sender_node_id = packet['fromId']
+        except (UnicodeDecodeError, AttributeError) as e:
+            logging.warning(f"Ignoring packet with undecodable payload: {e}")
+            return
 
-            sender_short_name = get_node_short_name(sender_node_id, interface)
-            receiver_short_name = get_node_short_name(get_node_id_from_num(to_id, interface),
-                                                      interface) if to_id else "Group Chat"
+        sender_short_name = get_node_short_name(sender_node_id, interface)
+        receiver_short_name = get_node_short_name(get_node_id_from_num(to_id, interface),
+                                                  interface) if to_id else "Group Chat"
 
-            bbs_nodes = interface.bbs_nodes
-            is_sync_message = any(message_string.startswith(prefix) for prefix in
-                                  ["BULLETIN|", "MAIL|", "DELETE_BULLETIN|", "DELETE_MAIL|"])
+        bbs_nodes = interface.bbs_nodes
+        is_sync_message = any(message_string.startswith(prefix) for prefix in
+                              ["BULLETIN|", "MAIL|", "DELETE_BULLETIN|", "DELETE_MAIL|"])
 
-            if sender_node_id in bbs_nodes:
-                if is_sync_message:
-                    sync_logger.info(
-                        f"RX from={sender_short_name}({sender_node_id}) msg=\"{message_string}\""
-                    )
-                    if sync_logger.isEnabledFor(logging.DEBUG):
-                        sync_logger.debug(f"RX RAW PACKET: {packet}")
-                    process_message(sender_id, message_string, interface, is_sync_message=True)
-                else:
-                    logging.info("Ignoring non-sync message from known BBS node")
-            elif to_id is not None and to_id != 0 and to_id != 255 and to_id == interface.myInfo.my_node_num:
-                access_logger.info(
-                    f"RX from={sender_short_name}({sender_node_id}) to={receiver_short_name}({to_id}) "
-                    f"msg=\"{message_string}\""
+        if sender_node_id in bbs_nodes:
+            if is_sync_message:
+                sync_logger.info(
+                    f"RX from={sender_short_name}({sender_node_id}) msg=\"{message_string}\""
                 )
-                if access_logger.isEnabledFor(logging.DEBUG):
-                    access_logger.debug(f"RX RAW PACKET: {packet}")
-                process_message(sender_id, message_string, interface, is_sync_message=False)
+                if sync_logger.isEnabledFor(logging.DEBUG):
+                    sync_logger.debug(f"RX RAW PACKET: {packet}")
+                process_message(sender_id, message_string, interface, is_sync_message=True)
             else:
-                logging.info("Ignoring message sent to group chat or from unknown node")
-    except KeyError as e:
+                logging.info("Ignoring non-sync message from known BBS node")
+        elif to_id is not None and to_id != 0 and to_id != 255 and to_id == interface.myInfo.my_node_num:
+            access_logger.info(
+                f"RX from={sender_short_name}({sender_node_id}) to={receiver_short_name}({to_id}) "
+                f"msg=\"{message_string}\""
+            )
+            if access_logger.isEnabledFor(logging.DEBUG):
+                access_logger.debug(f"RX RAW PACKET: {packet}")
+            process_message(sender_id, message_string, interface, is_sync_message=False)
+        else:
+            logging.info("Ignoring message sent to group chat or from unknown node")
+    except Exception as e:
         logging.error(f"Error processing packet: {e}")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(f"RAW PACKET: {packet}")
 
 def get_recipient_id_by_mail(unique_id):
     # Fix for Mail Delete sync issue
