@@ -14,6 +14,9 @@ from db_operations import add_bulletin, add_mail, delete_bulletin, delete_mail, 
 from js8call_integration import handle_js8call_command, handle_js8call_steps, handle_group_message_selection
 from utils import get_user_state, get_node_short_name, get_node_id_from_num, send_message
 
+access_logger = logging.getLogger('access')
+sync_logger = logging.getLogger('sync')
+
 main_menu_handlers = {
     "q": handle_quick_help_command,
     "b": lambda sender_id, interface: handle_help_command(sender_id, interface, 'bbs'),
@@ -188,7 +191,6 @@ def on_receive(packet, interface):
             sender_short_name = get_node_short_name(sender_node_id, interface)
             receiver_short_name = get_node_short_name(get_node_id_from_num(to_id, interface),
                                                       interface) if to_id else "Group Chat"
-            logging.info(f"Received message from user '{sender_short_name}' ({sender_node_id}) to {receiver_short_name}: {message_string}")
 
             bbs_nodes = interface.bbs_nodes
             is_sync_message = any(message_string.startswith(prefix) for prefix in
@@ -196,10 +198,21 @@ def on_receive(packet, interface):
 
             if sender_node_id in bbs_nodes:
                 if is_sync_message:
+                    sync_logger.info(
+                        f"RX from={sender_short_name}({sender_node_id}) msg=\"{message_string}\""
+                    )
+                    if sync_logger.isEnabledFor(logging.DEBUG):
+                        sync_logger.debug(f"RX RAW PACKET: {packet}")
                     process_message(sender_id, message_string, interface, is_sync_message=True)
                 else:
                     logging.info("Ignoring non-sync message from known BBS node")
             elif to_id is not None and to_id != 0 and to_id != 255 and to_id == interface.myInfo.my_node_num:
+                access_logger.info(
+                    f"RX from={sender_short_name}({sender_node_id}) to={receiver_short_name}({to_id}) "
+                    f"msg=\"{message_string}\""
+                )
+                if access_logger.isEnabledFor(logging.DEBUG):
+                    access_logger.debug(f"RX RAW PACKET: {packet}")
                 process_message(sender_id, message_string, interface, is_sync_message=False)
             else:
                 logging.info("Ignoring message sent to group chat or from unknown node")

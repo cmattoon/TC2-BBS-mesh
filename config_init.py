@@ -1,4 +1,5 @@
 import configparser
+import logging
 import time
 from typing import Any
 import meshtastic.stream_interface
@@ -46,6 +47,19 @@ def init_cli_parser() -> argparse.Namespace:
         action="store",
         help="MQTT topic to subscribe",
         default='meshtastic.receive')
+
+    parser.add_argument(
+        "--log-dir",
+        action="store",
+        help="Directory to write log files to (also settable via LOG_DIR env var). "
+             "Defaults to './logs'",
+        default=None)
+
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging (also settable via DEBUG_BBS env var)",
+        default=False)
     #
     # Add extra arguments here
     #...
@@ -112,7 +126,7 @@ def initialize_config(config_file: str = None) -> dict[str, Any]:
     if bbs_nodes == ['']:
         bbs_nodes = []
 
-    print(f"Configured to sync with the following BBS nodes: {bbs_nodes}")
+    logging.info(f"Configured to sync with the following BBS nodes: {bbs_nodes}")
 
     allowed_nodes = config.get('allow_list', 'allowed_nodes', fallback='').split(',')
     if allowed_nodes == ['']:
@@ -121,7 +135,7 @@ def initialize_config(config_file: str = None) -> dict[str, Any]:
     # Pi Zero doesn't like the node DB setup.
     disable_node_db = config.getboolean('hack', 'disable_node_db', fallback=False)
 
-    print(f"Nodes with Urgent board permissions: {allowed_nodes}")
+    logging.info(f"Nodes with Urgent board permissions: {allowed_nodes}")
 
     return {
         'disable_node_db': disable_node_db,
@@ -180,5 +194,5 @@ def get_interface(system_config:dict[str, Any]) -> meshtastic.stream_interface.S
             else:
                 raise ValueError("Invalid interface type specified in config file")
         except PermissionError as e:
-            print(f"PermissionError: {e}. Retrying in 5 seconds...")
+            logging.error(f"PermissionError: {e}. Retrying in 5 seconds...")
             time.sleep(5)

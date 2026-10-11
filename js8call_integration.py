@@ -7,6 +7,7 @@ import logging
 
 from meshtastic import BROADCAST_NUM
 
+from bbs_logging import get_feature_logger
 from command_handlers import handle_help_command
 from utils import send_message, update_user_state
 
@@ -25,11 +26,7 @@ def to_message(typ, value='', params=None):
 
 
 class JS8CallClient:
-    def __init__(self, interface, logger=None):
-        self.logger = logger or logging.getLogger('js8call')
-        self.logger.setLevel(logging.INFO)
-        self.logger.propagate = False
-
+    def __init__(self, interface, logger=None, debug=None):
         self.config = configparser.ConfigParser()
         self.config.read(config_file)
 
@@ -43,6 +40,11 @@ class JS8CallClient:
         self.js8urgent = self.config.get('js8call', 'js8urgent', fallback='').split(',')
         self.js8groups = [group.strip() for group in self.js8groups]
         self.js8urgent = [group.strip() for group in self.js8urgent]
+
+        # JS8Call is considered "enabled" when a db_file is configured (that's
+        # what gates connect()/insert_message() actually doing anything). When
+        # enabled, logs go to js8call.log; otherwise they fall back to app.log.
+        self.logger = logger or get_feature_logger('js8call', 'js8call.log', enabled=bool(self.db_file), debug=debug)
 
         self.connected = False
         self.sock = None
@@ -126,7 +128,7 @@ class JS8CallClient:
                 self.db_conn.execute(f'''
                     INSERT INTO {table} (sender, { 'receiver' if table == 'messages' else 'groupname' }, message)
                     VALUES (?, ?, ?)
-                ''', (sender, receiver_or_group, message))
+                ''', (sender, recipient, message))
         except sqlite3.Error as e:
             self.logger.error(f"Failed to insert message into {table} table: {e}")
 
@@ -160,7 +162,7 @@ class JS8CallClient:
             self.logger.info(f"Received JS8Call message: {sender} to {receiver} - {msg}")
 
             if receiver in self.js8urgent:
-                self.insert_urgent('urgent', sender, receiver, msg)
+                self.insert_message('urgent', sender, receiver, msg)
                 notification_message = f"💥 URGENT JS8Call Message Received 💥\nFrom: {sender}\nCheck BBS for message"
                 send_message(notification_message, BROADCAST_NUM, self.interface)
             elif receiver in self.js8groups:

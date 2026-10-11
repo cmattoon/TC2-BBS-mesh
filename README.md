@@ -123,7 +123,7 @@ $ python server.py --help
    ╚═╝    ╚═════╝╚══════╝      ╚═════╝ ╚═════╝ ╚══════╝
 Meshtastic Version
 
-usage: server.py [-h] [--config CONFIG] [--interface-type {serial,tcp}] [--port PORT] [--host HOST] [--mqtt-topic MQTT_TOPIC]
+usage: server.py [-h] [--config CONFIG] [--interface-type {serial,tcp}] [--port PORT] [--host HOST] [--mqtt-topic MQTT_TOPIC] [--log-dir LOG_DIR] [--debug]
 
 Meshtastic BBS system
 
@@ -137,6 +137,49 @@ options:
   --host HOST           TCP host address
   --mqtt-topic MQTT_TOPIC, -t MQTT_TOPIC
                         MQTT topic to subscribe
+  --log-dir LOG_DIR     Directory to write log files to (also settable via LOG_DIR env var). Defaults to './logs'
+  --debug               Enable debug logging (also settable via DEBUG_BBS env var)
+```
+
+## Logging
+
+TC²-BBS persists logs to disk under a log directory, resolved in this order:
+
+1. `--log-dir <dir>` CLI argument
+2. `LOG_DIR` environment variable
+3. `./logs` (relative to the current working directory)
+
+The directory is created automatically if it doesn't exist. Within it you'll find:
+
+| File | Contents |
+| --- | --- |
+| `app.log` | The main application/error log: INFO, WARNING, and ERROR messages (plus DEBUG when enabled). Anything from a feature that isn't enabled (JS8Call, sync) also falls back to here. |
+| `access.log` | Always on. One line per inbound user message and outbound reply, with sender/recipient metadata, so you can trace back what happened when someone reports an issue. |
+| `js8call.log` | Only created when JS8Call integration is enabled (a `db_file` is configured in `[js8call]`). Otherwise JS8Call's (sparse) log lines land in `app.log` instead. |
+| `sync.log` | Only created when BBS-to-BBS sync is enabled (`bbs_nodes` configured in `[sync]`). Otherwise sync-related log lines land in `app.log` instead. |
+
+All log files rotate automatically (10 MiB per file, 5 backups kept).
+
+### Debug mode
+
+Enable debug logging with `--debug` or by setting the `DEBUG_BBS` environment variable (any value other than empty/`0`/`false`/`no`/`off`):
+
+```sh
+python server.py --debug
+# or
+DEBUG_BBS=1 python server.py
+```
+
+With debug enabled:
+- `app.log` captures DEBUG-level messages in addition to INFO/ERROR.
+- `access.log` and `sync.log` additionally dump the raw packet/response objects for each message, right alongside their normal one-liner entries.
+
+### Choosing a log directory
+
+```sh
+python server.py --log-dir /var/log/tc2-bbs
+# or
+LOG_DIR=/var/log/tc2-bbs python server.py
 ```
 
 
